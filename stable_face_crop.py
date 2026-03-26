@@ -1326,54 +1326,34 @@ class MediaPipeFaceMeshFullFaceCrop:
 
 # region MediaPipeFaceMeshFullFaceCrop
 
-class MediaPipeFaceMeshFullFaceCrop:
+class MediaPipeFaceMeshLandmarksOnly:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "images": ("IMAGE",),
-                "output_face_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 16}),
-                "output_mouth_size": ("INT", {"default": 256, "min": 64, "max": 1024, "step": 16}),
-                "face_crop_margin": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "smoothing": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 0.99, "step": 0.01}),
-                "detect_every_n": ("INT", {"default": 1, "min": 1, "max": 30, "step": 1}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "LANDMARKS", "IMAGE", "FLOAT", "FLOAT")
-    RETURN_NAMES = ("face_crop", "mouth_crop", "landmarks", "debug_image", "mouth_strength", "tongue_strength")
+    RETURN_TYPES = ("LANDMARKS", "IMAGE")
+    RETURN_NAMES = ("landmarks", "debug_image")
     FUNCTION = "process"
     CATEGORY = "face/lipsync"
 
-    def process(self, images, output_face_size, output_mouth_size, face_crop_margin, smoothing, detect_every_n):
-        import torch
-        import numpy as np
+    def process(self, images):
+        # Импорт внутри метода
         import cv2
         from mediapipe import solutions as mp_solutions
 
         mp_face_mesh = mp_solutions.face_mesh
 
-        face_crop_images = []
-        mouth_crop_images = []
         landmarks_list = []
         debug_images = []
-        mouth_strengths = []
-        tongue_strengths = []
-
-        last_face_crop = None
-        last_landmarks = None
-
-        # Определяем области для более плотной сетки
-        MOUTH_IDS = list(range(48, 68))  # губы
-        LEFT_EYE_IDS = list(range(33, 133))  # левый глаз
-        RIGHT_EYE_IDS = list(range(362, 463))  # правый глаз
-        LEFT_BROW_IDS = list(range(70, 105))  # левая бровь
-        RIGHT_BROW_IDS = list(range(300, 335))  # правая бровь
-        TONGUE_IDS = list(range(78, 88))  # грубо, внутренние точки языка
 
         for img_tensor in images:
             img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
             h, w, _ = img_np.shape
+            debug_img = img_np.copy()
 
             with mp_face_mesh.FaceMesh(
                 static_image_mode=True,
@@ -1385,90 +1365,21 @@ class MediaPipeFaceMeshFullFaceCrop:
 
                 if results.multi_face_landmarks:
                     lm = results.multi_face_landmarks[0]
-
                     lm_array = np.array([[p.x * w, p.y * h, p.z] for p in lm.landmark], dtype=np.float32)
-                    last_landmarks = lm_array
                     landmarks_list.append(torch.from_numpy(lm_array))
 
-                    # ===== FACE CROP =====
-                    x_min, y_min = lm_array[:, 0].min(), lm_array[:, 1].min()
-                    x_max, y_max = lm_array[:, 0].max(), lm_array[:, 1].max()
-                    pad_x, pad_y = (x_max - x_min) * face_crop_margin, (y_max - y_min) * face_crop_margin
-                    x1, y1 = max(0, int(x_min - pad_x)), max(0, int(y_min - pad_y))
-                    x2, y2 = min(w, int(x_max + pad_x)), min(h, int(y_max + pad_y))
-                    face_crop_np = img_np[y1:y2, x1:x2]
-                    face_crop_np = cv2.resize(face_crop_np, (output_face_size, output_face_size))
-                    last_face_crop = face_crop_np
-
-                    # ===== MOUTH CROP =====
-                    mouth_pts = lm_array[MOUTH_IDS]
-                    mx1, my1 = mouth_pts[:, 0].min(), mouth_pts[:, 1].min()
-                    mx2, my2 = mouth_pts[:, 0].max(), mouth_pts[:, 1].max()
-                    pad = max(mx2 - mx1, my2 - my1) * 0.6
-                    mx1, my1 = max(0, int(mx1 - pad)), max(0, int(my1 - pad))
-                    mx2, my2 = min(w, int(mx2 + pad)), min(h, int(my2 + pad))
-                    mouth_crop_np = img_np[my1:my2, mx1:mx2]
-                    mouth_crop_np = cv2.resize(mouth_crop_np, (output_mouth_size, output_mouth_size))
-
-                    # ===== MOUTH METRICS =====
-                    top = lm_array[62]
-                    bottom = lm_array[66]
-                    left = lm_array[48]
-                    right = lm_array[54]
-                    mouth_open = np.linalg.norm(top - bottom)
-                    mouth_width = np.linalg.norm(left - right) + 1e-6
-                    ratio = mouth_open / mouth_width
-                    tongue = max(0.0, min(1.0, (ratio - 0.15) * 2.0))
-                    mouth_strengths.append(float(mouth_open))
-                    tongue_strengths.append(float(tongue))
-
-                    # ===== DEBUG IMAGE WITH MORE POINTS =====
-                    debug_img = img_np.copy()
-
-                    # все точки лица зелёные
+                    # Отрисовка debug изображения
                     for p in lm_array:
                         cv2.circle(debug_img, (int(p[0]), int(p[1])), 1, (0, 255, 0), -1)
-
-                    # губы красные
-                    for i in MOUTH_IDS:
-                        cv2.circle(debug_img, (int(lm_array[i][0]), int(lm_array[i][1])), 2, (0, 0, 255), -1)
-
-                    # глаза синие
-                    for i in LEFT_EYE_IDS + RIGHT_EYE_IDS:
-                        cv2.circle(debug_img, (int(lm_array[i][0]), int(lm_array[i][1])), 1, (255, 0, 0), -1)
-
-                    # брови оранжевые
-                    for i in LEFT_BROW_IDS + RIGHT_BROW_IDS:
-                        cv2.circle(debug_img, (int(lm_array[i][0]), int(lm_array[i][1])), 1, (0, 165, 255), -1)
-
-                    # язык фиолетовый
-                    for i in TONGUE_IDS:
-                        cv2.circle(debug_img, (int(lm_array[i][0]), int(lm_array[i][1])), 2, (128, 0, 128), -1)
-
                 else:
-                    # ===== FALLBACK =====
-                    if last_face_crop is not None:
-                        face_crop_np = last_face_crop
-                    else:
-                        face_crop_np = np.zeros((output_face_size, output_face_size, 3), dtype=np.uint8)
+                    # fallback, если лицо не найдено
+                    landmarks_list.append(None)
 
-                    mouth_crop_np = np.zeros((output_mouth_size, output_mouth_size, 3), dtype=np.uint8)
-                    landmarks_list.append(torch.from_numpy(last_landmarks) if last_landmarks is not None else None)
-                    debug_img = img_np.copy()
-                    mouth_strengths.append(0.0)
-                    tongue_strengths.append(0.0)
-
-                face_crop_images.append(torch.from_numpy(face_crop_np.astype(np.float32) / 255.0))
-                mouth_crop_images.append(torch.from_numpy(mouth_crop_np.astype(np.float32) / 255.0))
                 debug_images.append(torch.from_numpy(debug_img.astype(np.float32) / 255.0))
 
         return (
-            torch.stack(face_crop_images),
-            torch.stack(mouth_crop_images),
             landmarks_list,
-            torch.stack(debug_images),
-            torch.tensor(mouth_strengths),
-            torch.tensor(tongue_strengths),
+            torch.stack(debug_images)
         )
 
 # ═══════════════════════════════════════════════════════════════
@@ -1479,12 +1390,12 @@ NODE_CLASS_MAPPINGS = {
     "LipsyncCrop": LipsyncCrop,
     "LipsyncAutoCrop": LipsyncAutoCrop,
     "MediaPipeFaceMeshLipCrop": MediaPipeFaceMeshLipCrop,
-    "MediaPipeFaceMeshFullFaceCrop": MediaPipeFaceMeshFullFaceCrop,
+    "MediaPipeFaceMeshLandmarksOnly": MediaPipeFaceMeshLandmarksOnly,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LipsyncCrop": "🎯 Lipsync",
     "LipsyncAutoCrop": "🎯 Lipsync AUTO",
     "MediaPipeFaceMeshLipCrop": "🎯 Lipsync MediaPipe FaceMesh",
-    "MediaPipeFaceMeshFullFaceCrop": "🎯 FullFace MediaPipe FaceMesh",
+    "MediaPipeFaceMeshLandmarksOnly": "MediaPipeFaceMeshLandmarksOnly",
 }
