@@ -1340,47 +1340,245 @@ class MediaPipeFaceMeshLandmarksOnly:
     FUNCTION = "process"
     CATEGORY = "face/lipsync"
 
+    def _to_numpy_image(self, img):
+        if hasattr(img, "cpu") and hasattr(img, "numpy"):
+            img = img.cpu().numpy()
+        img = np.array(img, copy=False)
+
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=-1)
+        if img.ndim == 3 and img.shape[2] == 1:
+            img = np.concatenate([img, img, img], axis=2)
+        if img.ndim != 3 or img.shape[2] not in (3, 4):
+            raise ValueError("IMAGE input must be HxWxC or BxHxWxC with 3 or 4 channels")
+
+        if img.dtype in (np.float32, np.float64):
+            if img.max() <= 1.0:
+                img = np.clip(img * 255.0, 0, 255)
+            img = img.astype(np.uint8)
+        elif img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+
+        if img.shape[2] == 4:
+            img = img[:, :, :3]
+
+        return img
+
     def process(self, images):
-        # Импорт внутри метода
         import cv2
         from mediapipe import solutions as mp_solutions
 
-        mp_face_mesh = mp_solutions.face_mesh
+        if hasattr(images, "cpu") and hasattr(images, "numpy"):
+            images_np = images.cpu().numpy()
+        else:
+            images_np = images
+
+        frames = []
+        if isinstance(images_np, np.ndarray):
+            if images_np.ndim == 4:
+                for i in range(images_np.shape[0]):
+                    frames.append(self._to_numpy_image(images_np[i]))
+            elif images_np.ndim == 3:
+                frames.append(self._to_numpy_image(images_np))
+            else:
+                raise ValueError("IMAGE input numpy array must be 3D or 4D")
+        elif isinstance(images_np, (list, tuple)):
+            for item in images_np:
+                frames.append(self._to_numpy_image(item))
+        else:
+            raise ValueError("IMAGE input must be tensor, numpy array, or list/tuple")
 
         landmarks_list = []
         debug_images = []
 
-        for img_tensor in images:
-            img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
-            h, w, _ = img_np.shape
-            debug_img = img_np.copy()
+        with mp_solutions.face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        ) as face_mesh:
 
-            with mp_face_mesh.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=1,
-                refine_landmarks=True
-            ) as face_mesh:
+            for frame in frames:
+                h, w, _ = frame.shape
+                debug_img = frame.copy()
 
-                results = face_mesh.process(img_np[:, :, ::-1])
+                results = face_mesh.process(frame[:, :, ::-1])
 
-                if results.multi_face_landmarks:
-                    lm = results.multi_face_landmarks[0]
-                    lm_array = np.array([[p.x * w, p.y * h, p.z] for p in lm.landmark], dtype=np.float32)
+                if results and results.multi_face_landmarks and len(results.multi_face_landmarks) > 0:
+                    mp_landmarks = results.multi_face_landmarks[0].landmark
+
+                    lm_array = np.full((468, 3), np.nan, dtype=np.float32)
+                    for idx, p in enumerate(mp_landmarks):
+                        if idx >= 468:
+                            break
+                        lm_array[idx, 0] = float(np.clip(p.x * w, 0.0, float(w - 1)))
+                        lm_array[idx, 1] = float(np.clip(p.y * h, 0.0, float(h - 1)))
+                        lm_array[idx, 2] = float(p.z) if hasattr(p, "z") else 0.0
+
                     landmarks_list.append(torch.from_numpy(lm_array))
 
-                    # Отрисовка debug изображения
-                    for p in lm_array:
-                        cv2.circle(debug_img, (int(p[0]), int(p[1])), 1, (0, 255, 0), -1)
+                    for (x, y, _) in lm_array:
+                        if np.isfinite(x) and np.isfinite(y):
+                            cv2.circle(debug_img, (int(round(x)), int(round(y))), 1, (0, 255, 0), -1)
                 else:
-                    # fallback, если лицо не найдено
-                    landmarks_list.append(None)
+                    landmarks_list.append(torch.empty((0, 3), dtype=torch.float32))
+                    debug_img = np.zeros((h, w, 3), dtype=np.uint8)
 
                 debug_images.append(torch.from_numpy(debug_img.astype(np.float32) / 255.0))
 
-        return (
-            landmarks_list,
-            torch.stack(debug_images)
+        return landmarks_list, torch.stack(debug_images)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+#  region MediaPipeFaceControlVideo
+# ───────────────────────────────────────────────────────────────────────────
+
+import numpy as np
+import torch
+
+import cv2
+from mediapipe import solutions as mp_solutions
+
+FACE_CONTROL_FACE_OVAL_IDXS = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323,
+                               361, 288, 397, 365, 379, 378, 400, 377, 152, 148,
+                               176, 149, 150, 136, 172, 58, 132, 93, 234, 127,
+                               162, 21, 54, 103, 67, 109]
+
+FACE_CONTROL_LEFT_BROW_IDXS = [70, 63, 105, 66, 107, 55, 65, 52]
+FACE_CONTROL_RIGHT_BROW_IDXS = [336, 296, 334, 293, 300, 276, 283, 282]
+FACE_CONTROL_LEFT_EYE_IDXS = [33, 7, 163, 144, 145, 153, 154, 155, 133]
+FACE_CONTROL_RIGHT_EYE_IDXS = [263, 249, 390, 373, 374, 380, 381, 382, 362]
+FACE_CONTROL_LIPS_UPPER_IDXS = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291]
+FACE_CONTROL_LIPS_LOWER_IDXS = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308]
+
+
+class MediaPipeFaceControlVideo:
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "smoothing_strength": ("FLOAT", {
+                    "default": 0.7, "min": 0.0, "max": 0.99, "step": 0.01
+                }),
+                "scale_factor": ("FLOAT", {
+                    "default": 1.0, "min": 0.1, "max": 3.0, "step": 0.05
+                }),
+                "crop_margin": ("FLOAT", {
+                    "default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01
+                }),
+                "mode": ("STRING", {
+                    "default": "full"
+                }),
+                "debug": ("BOOLEAN", {
+                    "default": False
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("debug_image",)
+    FUNCTION = "process"
+    CATEGORY = "face/lipsync"
+
+    def _prepare_frames(self, image):
+        if hasattr(image, "cpu") and hasattr(image, "numpy"):
+            frames = image.cpu().numpy()
+        elif isinstance(image, np.ndarray):
+            frames = image
+        else:
+            raise ValueError("Unsupported input type")
+
+        if frames.ndim == 3:
+            frames = frames[np.newaxis, ...]
+
+        if frames.shape[-1] == 4:
+            frames = frames[..., :3]
+
+        if frames.dtype in (np.float32, np.float64):
+            frames = np.clip(frames * 255.0, 0, 255).astype(np.uint8)
+        else:
+            frames = frames.astype(np.uint8)
+
+        return frames
+
+    def process(self, image,
+                smoothing_strength=0.7,
+                scale_factor=1.0,
+                crop_margin=0.2,
+                mode="full",
+                debug=False):
+
+        frames = self._prepare_frames(image)
+        B, H, W, C = frames.shape
+
+        mp_face_mesh = mp_solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4,
         )
+
+        landmarks_all = np.full((B, 468, 2), np.nan, dtype=np.float32)
+        prev = None
+
+        for i in range(B):
+            frame = frames[i]
+            rgb = frame[..., :3]
+
+            results = mp_face_mesh.process(rgb)
+
+            if results.multi_face_landmarks:
+                pts = np.zeros((468, 2), dtype=np.float32)
+
+                for li, lm in enumerate(results.multi_face_landmarks[0].landmark):
+                    if li >= 468:
+                        break
+                    pts[li] = (lm.x * W, lm.y * H)
+
+                landmarks_all[i] = pts
+                prev = pts
+            else:
+                landmarks_all[i] = prev if prev is not None else np.nan
+
+        # fallback smooth (простая версия)
+        landmarks_all = np.nan_to_num(landmarks_all)
+
+        out_frames = []
+
+        for i in range(B):
+            pts = landmarks_all[i]
+
+            canvas = np.zeros((H, W, 3), dtype=np.uint8)
+
+            def draw(idx, closed=False):
+                p = pts[idx]
+                if len(p) < 2:
+                    return
+                p = np.clip(p, 0, [W - 1, H - 1]).astype(np.int32)
+                cv2.polylines(canvas, [p.reshape((-1, 1, 2))], closed, (255, 255, 255), 2)
+
+            if mode == "full":
+                draw(FACE_CONTROL_FACE_OVAL_IDXS, True)
+
+            draw(FACE_CONTROL_LEFT_BROW_IDXS)
+            draw(FACE_CONTROL_RIGHT_BROW_IDXS)
+            draw(FACE_CONTROL_LEFT_EYE_IDXS, True)
+            draw(FACE_CONTROL_RIGHT_EYE_IDXS, True)
+            draw(FACE_CONTROL_LIPS_UPPER_IDXS)
+            draw(FACE_CONTROL_LIPS_LOWER_IDXS)
+
+            if debug:
+                for x, y in pts:
+                    cv2.circle(canvas, (int(x), int(y)), 1, (0, 255, 0), -1)
+
+            out_frames.append(torch.from_numpy(canvas.astype(np.float32) / 255.0))
+
+        return (torch.stack(out_frames, dim=0),)
+
 
 # ═══════════════════════════════════════════════════════════════
 # Регистрация нод
@@ -1391,6 +1589,7 @@ NODE_CLASS_MAPPINGS = {
     "LipsyncAutoCrop": LipsyncAutoCrop,
     "MediaPipeFaceMeshLipCrop": MediaPipeFaceMeshLipCrop,
     "MediaPipeFaceMeshLandmarksOnly": MediaPipeFaceMeshLandmarksOnly,
+    "MediaPipeFaceControlVideo": MediaPipeFaceControlVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1398,4 +1597,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LipsyncAutoCrop": "🎯 Lipsync AUTO",
     "MediaPipeFaceMeshLipCrop": "🎯 Lipsync MediaPipe FaceMesh",
     "MediaPipeFaceMeshLandmarksOnly": "MediaPipeFaceMeshLandmarksOnly",
+    "MediaPipeFaceControlVideo": "🎯 MediaPipe Face Control Video",
 }
