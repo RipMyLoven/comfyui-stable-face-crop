@@ -1340,18 +1340,19 @@ class MediaPipeFaceMeshFullFaceCrop:
                 "line_thickness": ("INT", {"default": 1, "min": 1, "max": 20}),
                 "point_size": ("INT", {"default": 1, "min": 1, "max": 20}),
                 "smoothing": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 0.99}),
+                "mask_color": ("COLOR", {"default": "#00FF00"}),
             }
         }
 
     RETURN_TYPES = ("IMAGE", "LANDMARKS", "IMAGE")
-    RETURN_NAMES = ("face_crop", "landmarks", "debug_image")
+    RETURN_NAMES = ("face_crop", "landmarks", "mask_image")
     FUNCTION = "process"
     CATEGORY = "face/lipsync"
-    DESCRIPTION = "🔥 PRO FaceMesh: full face, stable tracking, clean topology, no chaos."
+    DESCRIPTION = "🔥 PRO FaceMesh: маска лица на чёрном фоне."
 
     def process(self, images, output_face_size, face_crop_margin,
                 draw_mesh, draw_contours, point_density,
-                line_thickness, point_size, smoothing):
+                line_thickness, point_size, smoothing, mask_color="#00FF00"):
 
         import torch
         import numpy as np
@@ -1361,11 +1362,14 @@ class MediaPipeFaceMeshFullFaceCrop:
 
         mp_face_mesh = mp_solutions.face_mesh
 
+        # Парсинг цвета маски
+        mask_color_bgr = tuple(int(mask_color.lstrip('#')[i:i+2], 16) for i in (4, 2, 0))
+
         face_crop_images = []
         landmarks_list = []
-        debug_images = []
+        mask_images = []
 
-        prev_landmarks = None  # для стабилизации
+        prev_landmarks = None
 
         with mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True) as face_mesh:
             for img_tensor in images:
@@ -1405,8 +1409,8 @@ class MediaPipeFaceMeshFullFaceCrop:
 
                     face_crop_images.append(torch.from_numpy(face_crop_resized.astype(np.float32) / 255.0))
 
-                    # 🔥 DEBUG
-                    debug_img = img_np.copy()
+                    # 🔥 MASK ON BLACK BACKGROUND
+                    mask_img = np.zeros((h, w, 3), dtype=np.uint8)  # Чёрный фон
 
                     def draw_connections(connections, color):
                         for i, (start, end) in enumerate(connections):
@@ -1416,29 +1420,29 @@ class MediaPipeFaceMeshFullFaceCrop:
                             if start < len(lm_array) and end < len(lm_array):
                                 pt1 = tuple(map(int, lm_array[start][:2]))
                                 pt2 = tuple(map(int, lm_array[end][:2]))
-                                cv2.line(debug_img, pt1, pt2, color, line_thickness)
+                                cv2.line(mask_img, pt1, pt2, color, line_thickness)
 
                     if draw_mesh:
-                        draw_connections(FACEMESH_TESSELATION, (0, 255, 0))
+                        draw_connections(FACEMESH_TESSELATION, mask_color_bgr)
 
                     if draw_contours:
-                        draw_connections(FACEMESH_CONTOURS, (255, 0, 0))
+                        draw_connections(FACEMESH_CONTOURS, mask_color_bgr)
 
                     # 🔥 POINTS
                     for i, p in enumerate(lm_array):
                         if i % point_density != 0:
                             continue
                         pt = tuple(map(int, p[:2]))
-                        cv2.circle(debug_img, pt, point_size, (0, 0, 255), -1)
+                        cv2.circle(mask_img, pt, point_size, mask_color_bgr, -1)
 
-                    debug_images.append(torch.from_numpy(debug_img.astype(np.float32) / 255.0))
+                    mask_images.append(torch.from_numpy(mask_img.astype(np.float32) / 255.0))
 
                 else:
                     landmarks_list.append(None)
                     face_crop_images.append(torch.zeros((output_face_size, output_face_size, 3)))
-                    debug_images.append(torch.zeros_like(img_tensor))
+                    mask_images.append(torch.zeros((h, w, 3)))
 
-        return (torch.stack(face_crop_images), landmarks_list, torch.stack(debug_images))
+        return (torch.stack(face_crop_images), landmarks_list, torch.stack(mask_images))
 
 # ═══════════════════════════════════════════════════════════════
 # Регистрация нод
