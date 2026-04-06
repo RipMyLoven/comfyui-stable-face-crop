@@ -1444,6 +1444,497 @@ class MediaPipeFaceMeshFullFaceCrop:
 
         return (torch.stack(face_crop_images), landmarks_list, torch.stack(mask_images))
 
+
+# ═══════════════════════════════════════════════════════════════
+# MediaPipe Pose + Hands + Optical Flow Motion Node
+# ═══════════════════════════════════════════════════════════════
+
+class MediaPipePoseHandsMotion:
+    """
+    Video motion extraction via MediaPipe Pose + Hands + Optical Flow.
+    Modes:
+      skeleton → R=Pose, G=Hands, B=Motion (RGB composite)
+      mask     → white silhouette filled from pose convex hull
+      heatmap  → motion-only heat map (blue→red colormap)
+      velocity → per-landmark velocity magnitude dots
+    """
+
+    _POSE_CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 7),
+        (0, 4), (4, 5), (5, 6), (6, 8),
+        (9, 10),
+        (11, 12),
+        (11, 13), (13, 15), (15, 17), (15, 19), (15, 21),
+        (12, 14), (14, 16), (16, 18), (16, 20), (16, 22),
+        (11, 23), (12, 24),
+        (23, 24), (23, 25), (24, 26),
+        (25, 27), (26, 28),
+        (27, 29), (28, 30),
+        (29, 31), (30, 32),
+    ]
+
+    _HAND_CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (0, 5), (5, 6), (6, 7), (7, 8),
+        (0, 9), (9, 10), (10, 11), (11, 12),
+        (0, 13), (13, 14), (14, 15), (15, 16),
+        (0, 17), (17, 18), (18, 19), (19, 20),
+        (5, 9), (9, 13), (13, 17),
+    ]
+
+    _JOINT_WEIGHTS = {}
+    for _i in range(33):
+        if _i in (15, 16, 17, 18, 19, 20, 21, 22):
+            _JOINT_WEIGHTS[_i] = 1.8
+        elif _i in (11, 12, 13, 14):
+            _JOINT_WEIGHTS[_i] = 1.2
+        else:
+            _JOINT_WEIGHTS[_i] = 1.0
+
+    _pose_model = None
+    _hands_model = None
+
+    _POSE_MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    )
+    _HANDS_MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+        "hand_landmarker/float16/1/hand_landmarker.task"
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pose_data": ("IMAGE",),
+                "render_size": ("INT", {"default": 512, "min": 128, "max": 2048, "step": 8}),
+                "mode": (["skeleton", "mask", "heatmap", "velocity"],),
+                "smoothing": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 0.95, "step": 0.05}),
+                "line_thickness": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "point_radius": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "process"
+    CATEGORY = "motion"
+
+    @classmethod
+    def _get_model_path(cls, filename, url):
+        import os, urllib.request
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mp_models")
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, filename)
+        if not os.path.exists(path):
+            print(f"[MediaPipePoseHandsMotion] Downloading {filename} ...")
+            urllib.request.urlretrieve(url, path)
+            print(f"[MediaPipePoseHandsMotion] Saved to {path}")
+        return path
+
+    @classmethod
+    def _init_models(cls):
+        if cls._pose_model is None or cls._hands_model is None:
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision as mp_vision
+
+            pose_path = cls._get_model_path("pose_landmarker_lite.task", cls._POSE_MODEL_URL)
+            hands_path = cls._get_model_path("hand_landmarker.task", cls._HANDS_MODEL_URL)
+
+            pose_opts = mp_vision.PoseLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=pose_path),
+                running_mode=mp_vision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            cls._pose_model = mp_vision.PoseLandmarker.create_from_options(pose_opts)
+
+            hands_opts = mp_vision.HandLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=hands_path),
+                running_mode=mp_vision.RunningMode.IMAGE,
+                num_hands=2,
+                min_hand_detection_confidence=0.5,
+                min_hand_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            cls._hands_model = mp_vision.HandLandmarker.create_from_options(hands_opts)
+
+    def _compute_render_transform(self, landmarks_xy, render_size):
+        if len(landmarks_xy) == 0:
+            return 1.0, 0.0, 0.0
+        xs, ys = landmarks_xy[:, 0], landmarks_xy[:, 1]
+        min_x, max_x = float(np.min(xs)), float(np.max(xs))
+        min_y, max_y = float(np.min(ys)), float(np.max(ys))
+        span = max(max_x - min_x, max_y - min_y, 1e-6)
+        usable = render_size * 0.8
+        scale = usable / span
+        off_x = render_size / 2.0 - (min_x + max_x) / 2.0 * scale
+        off_y = render_size / 2.0 - (min_y + max_y) / 2.0 * scale
+        return scale, off_x, off_y
+
+    @staticmethod
+    def _rc(x, y, scale, off_x, off_y):
+        return int(round(x * scale + off_x)), int(round(y * scale + off_y))
+
+    def _detect(self, frame_rgb):
+        import mediapipe as mp
+        H, W = frame_rgb.shape[:2]
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+
+        pose_res = self._pose_model.detect(mp_img)
+        hands_res = self._hands_model.detect(mp_img)
+
+        cur_pose = None
+        if pose_res.pose_landmarks:
+            lms = pose_res.pose_landmarks[0]
+            cur_pose = np.array(
+                [[lm.x * W, lm.y * H,
+                  lm.visibility if lm.visibility is not None else 1.0]
+                 for lm in lms], dtype=np.float32)
+
+        cur_hands = []
+        if hands_res.hand_landmarks:
+            for hlm in hands_res.hand_landmarks:
+                cur_hands.append(np.array(
+                    [[lm.x * W, lm.y * H, 1.0] for lm in hlm], dtype=np.float32))
+
+        return cur_pose, cur_hands
+
+    def _gather_transform(self, pose_draw, hands_draw, S):
+        all_pts = []
+        if pose_draw is not None:
+            all_pts.append(pose_draw[:, :2])
+        if hands_draw:
+            for h in hands_draw:
+                all_pts.append(h[:, :2])
+        if len(all_pts) > 0:
+            return self._compute_render_transform(np.concatenate(all_pts, axis=0), S)
+        return 1.0, 0.0, 0.0
+
+    # ─── Rendering modes ───────────────────────────────────────
+
+    def _render_skeleton(self, S, pose_draw, hands_draw, flow_mag,
+                         pose_velocity, hand_velocity_maps,
+                         scale, off_x, off_y, is_first,
+                         line_thickness, point_radius, cv2_mod):
+        cv2 = cv2_mod
+        r_ch = np.zeros((S, S), dtype=np.float32)
+        g_ch = np.zeros((S, S), dtype=np.float32)
+        b_ch = np.zeros((S, S), dtype=np.float32)
+
+        if pose_draw is not None:
+            for (a, b) in self._POSE_CONNECTIONS:
+                if a >= len(pose_draw) or b >= len(pose_draw):
+                    continue
+                va, vb = pose_draw[a, 2], pose_draw[b, 2]
+                if va < 0.3 or vb < 0.3:
+                    continue
+                p1 = self._rc(pose_draw[a, 0], pose_draw[a, 1], scale, off_x, off_y)
+                p2 = self._rc(pose_draw[b, 0], pose_draw[b, 1], scale, off_x, off_y)
+                wa = self._JOINT_WEIGHTS.get(a, 1.0)
+                wb = self._JOINT_WEIGHTS.get(b, 1.0)
+                bright = min(float(min(va, vb)) * (wa + wb) / 2.0, 1.0)
+                cv2.line(r_ch, p1, p2, float(bright), line_thickness, cv2.LINE_AA)
+            for pi in range(len(pose_draw)):
+                if pose_draw[pi, 2] < 0.3:
+                    continue
+                pt = self._rc(pose_draw[pi, 0], pose_draw[pi, 1], scale, off_x, off_y)
+                w = self._JOINT_WEIGHTS.get(pi, 1.0)
+                cv2.circle(r_ch, pt, point_radius, float(min(pose_draw[pi, 2] * w, 1.0)), -1, cv2.LINE_AA)
+
+        if hands_draw:
+            for hand in hands_draw:
+                for (a, b) in self._HAND_CONNECTIONS:
+                    if a >= len(hand) or b >= len(hand):
+                        continue
+                    p1 = self._rc(hand[a, 0], hand[a, 1], scale, off_x, off_y)
+                    p2 = self._rc(hand[b, 0], hand[b, 1], scale, off_x, off_y)
+                    cv2.line(g_ch, p1, p2, 1.0, line_thickness, cv2.LINE_AA)
+                for pi in range(len(hand)):
+                    pt = self._rc(hand[pi, 0], hand[pi, 1], scale, off_x, off_y)
+                    cv2.circle(g_ch, pt, point_radius, 1.0, -1, cv2.LINE_AA)
+
+        if not is_first:
+            flow_norm = flow_mag.copy()
+            fm = flow_norm.max()
+            if fm > 1e-6:
+                flow_norm /= fm
+            b_ch += cv2.resize(flow_norm, (S, S), interpolation=cv2.INTER_LINEAR) * 0.5
+
+            if pose_draw is not None:
+                for pi in range(min(len(pose_draw), len(pose_velocity))):
+                    if pose_draw[pi, 2] < 0.3 or pose_velocity[pi] < 1e-3:
+                        continue
+                    pt = self._rc(pose_draw[pi, 0], pose_draw[pi, 1], scale, off_x, off_y)
+                    v = pose_velocity[pi]
+                    w = self._JOINT_WEIGHTS.get(pi, 1.0)
+                    r = int(np.clip(v * scale * 0.05 * w, 2, 30))
+                    cv2.circle(b_ch, pt, r, float(min(v * scale * 0.002 * w, 0.5)), -1, cv2.LINE_AA)
+
+            if hands_draw and hand_velocity_maps:
+                for hi, hand in enumerate(hands_draw):
+                    if hi >= len(hand_velocity_maps):
+                        break
+                    for pi in range(min(len(hand), len(hand_velocity_maps[hi]))):
+                        v = hand_velocity_maps[hi][pi]
+                        if v < 1e-3:
+                            continue
+                        pt = self._rc(hand[pi, 0], hand[pi, 1], scale, off_x, off_y)
+                        r = int(np.clip(v * scale * 0.06, 3, 35))
+                        cv2.circle(b_ch, pt, r, float(min(v * scale * 0.003, 0.6)), -1, cv2.LINE_AA)
+
+            if b_ch.max() > 1e-6:
+                b_ch = cv2.GaussianBlur(b_ch, (15, 15), 0)
+                bm = b_ch.max()
+                if bm > 1e-6:
+                    b_ch /= bm
+
+        canvas = np.zeros((S, S, 3), dtype=np.float32)
+        canvas[:, :, 0] = np.clip(r_ch, 0.0, 1.0)
+        canvas[:, :, 1] = np.clip(g_ch, 0.0, 1.0)
+        canvas[:, :, 2] = np.clip(b_ch, 0.0, 1.0)
+        return canvas
+
+    def _render_mask(self, S, pose_draw, hands_draw, scale, off_x, off_y,
+                     line_thickness, point_radius, cv2_mod):
+        cv2 = cv2_mod
+        canvas = np.zeros((S, S, 3), dtype=np.float32)
+        pts_list = []
+        if pose_draw is not None:
+            for pi in range(len(pose_draw)):
+                if pose_draw[pi, 2] < 0.3:
+                    continue
+                pts_list.append(self._rc(pose_draw[pi, 0], pose_draw[pi, 1], scale, off_x, off_y))
+        if hands_draw:
+            for hand in hands_draw:
+                for pi in range(len(hand)):
+                    pts_list.append(self._rc(hand[pi, 0], hand[pi, 1], scale, off_x, off_y))
+        if len(pts_list) >= 3:
+            hull = cv2.convexHull(np.array(pts_list, dtype=np.int32))
+            cv2.fillConvexPoly(canvas, hull, (1.0, 1.0, 1.0), cv2.LINE_AA)
+            cv2.polylines(canvas, [hull], True, (0.7, 0.7, 0.7), line_thickness, cv2.LINE_AA)
+        if pose_draw is not None:
+            for pi in range(len(pose_draw)):
+                if pose_draw[pi, 2] < 0.3:
+                    continue
+                pt = self._rc(pose_draw[pi, 0], pose_draw[pi, 1], scale, off_x, off_y)
+                cv2.circle(canvas, pt, point_radius, (0.9, 0.2, 0.2), -1, cv2.LINE_AA)
+        if hands_draw:
+            for hand in hands_draw:
+                for pi in range(len(hand)):
+                    pt = self._rc(hand[pi, 0], hand[pi, 1], scale, off_x, off_y)
+                    cv2.circle(canvas, pt, point_radius, (0.2, 0.9, 0.2), -1, cv2.LINE_AA)
+        return canvas
+
+    def _render_heatmap(self, S, flow_mag, pose_draw, pose_velocity,
+                        hands_draw, hand_velocity_maps,
+                        scale, off_x, off_y, is_first, cv2_mod):
+        cv2 = cv2_mod
+        heat = np.zeros((S, S), dtype=np.float32)
+        if is_first:
+            return np.zeros((S, S, 3), dtype=np.float32)
+
+        flow_norm = flow_mag.copy()
+        fm = flow_norm.max()
+        if fm > 1e-6:
+            flow_norm /= fm
+        heat += cv2.resize(flow_norm, (S, S), interpolation=cv2.INTER_LINEAR)
+
+        if pose_draw is not None:
+            for pi in range(min(len(pose_draw), len(pose_velocity))):
+                if pose_draw[pi, 2] < 0.3 or pose_velocity[pi] < 1e-3:
+                    continue
+                pt = self._rc(pose_draw[pi, 0], pose_draw[pi, 1], scale, off_x, off_y)
+                v = pose_velocity[pi]
+                w = self._JOINT_WEIGHTS.get(pi, 1.0)
+                r = int(np.clip(v * scale * 0.08 * w, 3, 40))
+                cv2.circle(heat, pt, r, float(min(v * scale * 0.004 * w, 1.0)), -1, cv2.LINE_AA)
+
+        if hands_draw and hand_velocity_maps:
+            for hi, hand in enumerate(hands_draw):
+                if hi >= len(hand_velocity_maps):
+                    break
+                for pi in range(min(len(hand), len(hand_velocity_maps[hi]))):
+                    v = hand_velocity_maps[hi][pi]
+                    if v < 1e-3:
+                        continue
+                    pt = self._rc(hand[pi, 0], hand[pi, 1], scale, off_x, off_y)
+                    r = int(np.clip(v * scale * 0.08, 3, 40))
+                    cv2.circle(heat, pt, r, float(min(v * scale * 0.005, 1.0)), -1, cv2.LINE_AA)
+
+        heat = cv2.GaussianBlur(heat, (21, 21), 0)
+        hm = heat.max()
+        if hm > 1e-6:
+            heat /= hm
+        heat_u8 = (heat * 255).clip(0, 255).astype(np.uint8)
+        colored = cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET).astype(np.float32) / 255.0
+        mask = heat[:, :, None] > 0.02
+        canvas = np.zeros((S, S, 3), dtype=np.float32)
+        canvas[mask[:, :, 0]] = colored[mask[:, :, 0]][:, ::-1]
+        return canvas
+
+    def _render_velocity(self, S, pose_draw, hands_draw,
+                         pose_velocity, hand_velocity_maps,
+                         scale, off_x, off_y, is_first,
+                         point_radius, cv2_mod):
+        cv2 = cv2_mod
+        canvas = np.zeros((S, S, 3), dtype=np.float32)
+        if is_first:
+            return canvas
+
+        max_vel = 0.0
+        if len(pose_velocity) > 0:
+            max_vel = max(max_vel, float(pose_velocity.max()))
+        for hv in hand_velocity_maps:
+            if len(hv) > 0:
+                max_vel = max(max_vel, float(hv.max()))
+        if max_vel < 1e-6:
+            return canvas
+
+        if pose_draw is not None:
+            for pi in range(min(len(pose_draw), len(pose_velocity))):
+                if pose_draw[pi, 2] < 0.3:
+                    continue
+                v = pose_velocity[pi] / max_vel
+                if v < 0.01:
+                    continue
+                pt = self._rc(pose_draw[pi, 0], pose_draw[pi, 1], scale, off_x, off_y)
+                r = max(point_radius, int(point_radius * (1.0 + v * 3.0)))
+                color = (float(v), float(0.3 * (1.0 - v)), float(1.0 - v))
+                cv2.circle(canvas, pt, r, color, -1, cv2.LINE_AA)
+
+        if hands_draw and hand_velocity_maps:
+            for hi, hand in enumerate(hands_draw):
+                if hi >= len(hand_velocity_maps):
+                    break
+                for pi in range(min(len(hand), len(hand_velocity_maps[hi]))):
+                    v = hand_velocity_maps[hi][pi] / max_vel
+                    if v < 0.01:
+                        continue
+                    pt = self._rc(hand[pi, 0], hand[pi, 1], scale, off_x, off_y)
+                    r = max(point_radius, int(point_radius * (1.0 + v * 4.0)))
+                    color = (float(v), float(0.8 * v), float(1.0 - v))
+                    cv2.circle(canvas, pt, r, color, -1, cv2.LINE_AA)
+
+        return canvas
+
+    # ─── Main processing ──────────────────────────────────────
+
+    def process(self, pose_data, render_size=512, mode="skeleton",
+                smoothing=0.6, line_thickness=2, point_radius=3):
+        import cv2
+
+        self._init_models()
+
+        S = render_size
+        alpha = smoothing
+
+        if isinstance(pose_data, torch.Tensor):
+            batch_np = (pose_data.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        else:
+            batch_np = np.array(pose_data)
+
+        B = batch_np.shape[0]
+        output_frames = []
+
+        prev_gray = None
+        prev_pose_lm = None
+        prev_hand_lms = None
+        smoothed_pose = None
+        smoothed_hands = None
+
+        pbar = comfy.utils.ProgressBar(B)
+
+        for idx in range(B):
+            frame_rgb = batch_np[idx]
+            gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+            H_orig, W_orig = frame_rgb.shape[:2]
+
+            cur_pose, cur_hands = self._detect(frame_rgb)
+
+            # Temporal smoothing
+            if cur_pose is not None:
+                if smoothed_pose is not None:
+                    smoothed_pose = smoothed_pose * alpha + cur_pose * (1.0 - alpha)
+                else:
+                    smoothed_pose = cur_pose.copy()
+            pose_draw = smoothed_pose
+
+            if len(cur_hands) > 0:
+                if smoothed_hands is not None and len(smoothed_hands) == len(cur_hands):
+                    smoothed_hands = [
+                        sp * alpha + ch * (1.0 - alpha)
+                        for sp, ch in zip(smoothed_hands, cur_hands)
+                    ]
+                else:
+                    smoothed_hands = [h.copy() for h in cur_hands]
+            hands_draw = smoothed_hands
+
+            # Optical flow
+            flow_mag = np.zeros((H_orig, W_orig), dtype=np.float32)
+            if prev_gray is not None:
+                flow = cv2.calcOpticalFlowFarneback(
+                    prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+                mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                flow_mag = mag
+
+            # Landmark velocity
+            pose_velocity = np.zeros(33, dtype=np.float32)
+            if cur_pose is not None and prev_pose_lm is not None:
+                diff = cur_pose[:, :2] - prev_pose_lm[:, :2]
+                pose_velocity = np.sqrt(diff[:, 0] ** 2 + diff[:, 1] ** 2)
+
+            hand_velocity_maps = []
+            if len(cur_hands) > 0 and prev_hand_lms is not None:
+                for ci, ch in enumerate(cur_hands):
+                    if ci < len(prev_hand_lms):
+                        diff = ch[:, :2] - prev_hand_lms[ci][:, :2]
+                        hand_velocity_maps.append(np.sqrt(diff[:, 0] ** 2 + diff[:, 1] ** 2))
+                    else:
+                        hand_velocity_maps.append(np.zeros(21, dtype=np.float32))
+
+            scale, off_x, off_y = self._gather_transform(pose_draw, hands_draw, S)
+            is_first = (idx == 0)
+
+            if mode == "skeleton":
+                canvas = self._render_skeleton(
+                    S, pose_draw, hands_draw, flow_mag,
+                    pose_velocity, hand_velocity_maps,
+                    scale, off_x, off_y, is_first,
+                    line_thickness, point_radius, cv2)
+            elif mode == "mask":
+                canvas = self._render_mask(
+                    S, pose_draw, hands_draw, scale, off_x, off_y,
+                    line_thickness, point_radius, cv2)
+            elif mode == "heatmap":
+                canvas = self._render_heatmap(
+                    S, flow_mag, pose_draw, pose_velocity,
+                    hands_draw, hand_velocity_maps,
+                    scale, off_x, off_y, is_first, cv2)
+            elif mode == "velocity":
+                canvas = self._render_velocity(
+                    S, pose_draw, hands_draw,
+                    pose_velocity, hand_velocity_maps,
+                    scale, off_x, off_y, is_first,
+                    point_radius, cv2)
+            else:
+                canvas = np.zeros((S, S, 3), dtype=np.float32)
+
+            output_frames.append(canvas)
+
+            prev_gray = gray
+            prev_pose_lm = cur_pose
+            prev_hand_lms = cur_hands if len(cur_hands) > 0 else prev_hand_lms
+
+            pbar.update_absolute(idx, B)
+
+        result = np.stack(output_frames, axis=0)
+        return (torch.from_numpy(result).float(),)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Регистрация нод
 # ══════════════════════════════════════════════════════════════
@@ -1453,6 +1944,7 @@ NODE_CLASS_MAPPINGS = {
     "LipsyncAutoCrop": LipsyncAutoCrop,
     "MediaPipeFaceMeshLipCrop": MediaPipeFaceMeshLipCrop,
     "MediaPipeFaceMeshFullFaceCrop": MediaPipeFaceMeshFullFaceCrop,
+    "MediaPipePoseHandsMotion": MediaPipePoseHandsMotion,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1460,4 +1952,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LipsyncAutoCrop": "🎯 Lipsync AUTO",
     "MediaPipeFaceMeshLipCrop": "🎯 Lipsync MediaPipe FaceMesh",
     "MediaPipeFaceMeshFullFaceCrop": "🎯 FullFace MediaPipe FaceMesh",
+    "MediaPipePoseHandsMotion": "🎭 Pose+Hands Motion Extractor",
 }
